@@ -72,10 +72,12 @@ def factor_counterfactual(panel: pd.DataFrame, host: str, first_post: int) -> tu
 
     def fit_predict(k: int, train: np.ndarray) -> np.ndarray:
         F = np.column_stack([np.ones(len(v))] + [Vt[j] for j in range(k)])   # intercept = unit effect
-        beta, *_ = np.linalg.lstsq(F[train], yh[train], rcond=None)
+        A = F[train]
+        pen = 0.5 * np.eye(A.shape[1]); pen[0, 0] = 0.0          # ridge on loadings, not on the level
+        beta = np.linalg.solve(A.T @ A + pen, A.T @ yh[train])
         return F @ beta
 
-    kmax = max(0, min(5, len(pre_idx) - 3))
+    kmax = max(0, min(2, len(pre_idx) - 4))
     cv = {}
     for k in range(kmax + 1):
         errs = [(fit_predict(k, np.setdiff1d(pre_idx, [t]))[t] - yh[t]) ** 2 for t in pre_idx]
@@ -86,6 +88,8 @@ def factor_counterfactual(panel: pd.DataFrame, host: str, first_post: int) -> tu
 
 def run_event(df: pd.DataFrame, var: str, host: str, event_year: int, award: int, rng, pre_len: int = PRE) -> dict | None:
     last = int(df.dropna(subset=[var])["year"].max())
+    if var == "ln_arr":
+        last = min(last, 2019)                                     # COVID wipes out 2020-22 tourism everywhere
     y0, y1 = award - pre_len, min(event_year + POST, last)
     if y1 <= event_year:
         return None
@@ -94,12 +98,24 @@ def run_event(df: pd.DataFrame, var: str, host: str, event_year: int, award: int
     if host not in wide.index or wide.loc[host].isna().any():
         return None
     donors = wide.drop(index=[i for i in wide.index if i in EVER_HOSTS]).dropna()
-    if len(donors) < 15:
+    # comparable donors only: level at the award year within a band around the host's
+    # (a rich host must be compared with rich countries), widening the band until >= 12 qualify
+    lvl = wide[award]
+    for band in (np.log(2.5), np.log(4), np.log(6), np.log(10)):
+        near = donors[(lvl[donors.index] - lvl[host]).abs() <= band]
+        if len(near) >= 12:
+            break
+    donors = near
+    if len(donors) < 8:
         return None
     # anchor every series at its award-year value so we compare growth paths
     panel = pd.concat([wide.loc[[host]], donors])
     panel = panel.sub(panel[award], axis=0)
     pre = panel.columns < award
+    # keep the 25 donors whose pre-award paths are closest to the host (limits interpolation bias)
+    dist = ((panel.loc[donors.index, pre] - panel.loc[host, pre]) ** 2).mean(axis=1)
+    donors = donors.loc[dist.nsmallest(25).index]
+    panel = panel.loc[[host] + list(donors.index)]
     w = synth_weights(panel.loc[host, pre].values, panel.loc[donors.index, pre].values.T)
     sc = pd.Series(panel.loc[donors.index].values.T @ w, index=panel.columns)
     mc, k = factor_counterfactual(panel, host, award)
